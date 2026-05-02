@@ -18,11 +18,20 @@
 6. [Quick install](#6-quick-install)
 7. [Usage](#7-usage)
 8. [Operations](#8-operations)
-9. [Documentation map](#9-documentation-map)
-10. [Roadmap & status](#10-roadmap--status)
-11. [Risk register](#11-risk-register)
-12. [Related projects & OSS NVR comparison](#12-related-projects--oss-nvr-comparison)
-13. [License & contributing](#13-license--contributing)
+9. [Protocol exchange diagrams](#9-protocol-exchange-diagrams)
+10. [Configuration deep-dive](#10-configuration-deep-dive)
+11. [Code walkthrough](#11-code-walkthrough)
+12. [Security & threat model](#12-security--threat-model)
+13. [Networking deep-dive](#13-networking-deep-dive)
+14. [Migration guides](#14-migration-guides)
+15. [API reference](#15-api-reference)
+16. [Documentation map](#16-documentation-map)
+17. [Roadmap & status](#17-roadmap--status)
+18. [Risk register](#18-risk-register)
+19. [Related projects & OSS NVR comparison](#19-related-projects--oss-nvr-comparison)
+20. [Glossary](#20-glossary)
+21. [Changelog](#21-changelog)
+22. [License & contributing](#22-license--contributing)
 
 ---
 
@@ -529,7 +538,688 @@ echo 'RETAIN_HOURS=1' | sudo tee -a /etc/cron.d/dvr-cleanup
 
 ---
 
-## 9. Documentation map
+## 9. Protocol exchange diagrams
+
+### 9.1 페이지 로드 → WebRTC 라이브 시작 (WHEP 협상)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as Browser
+    participant N as nginx :8090
+    participant M as MediaMTX :8889 (WHEP)
+    participant F as ffmpeg → :8554 (RTSP)
+    participant C as IMX219 (rpicam-vid)
+
+    Note over C,F: 보드 부팅 시 이미 publishing 중
+    C->>F: H.264 elementary stream (pipe)
+    F->>M: RTSP ANNOUNCE/SETUP/RECORD path=cam (TCP 8554)
+
+    B->>N: GET /player/ (HTTP 200, index.html)
+    N-->>B: hls.js + Plyr 스크립트
+    B->>B: new RTCPeerConnection({iceServers: []})
+    B->>B: addTransceiver('video', recvonly)
+    B->>B: createOffer(); setLocalDescription(offer)
+    B->>B: ICE gathering (Tailscale 인터페이스 candidate)
+    B->>M: POST /cam/whep<br/>Content-Type: application/sdp<br/>(SDP offer)
+    M-->>B: 201 Created<br/>Content-Type: application/sdp<br/>Location: /cam/whep/<sessionId><br/>(SDP answer with ICE candidates)
+    B->>B: setRemoteDescription(answer)
+    B-->>M: STUN binding requests (UDP :8189)
+    M-->>B: STUN binding responses<br/>→ ICE state: connected
+    M->>B: SRTP packets (UDP :8189 → 클라이언트)
+    Note over B: video.srcObject = stream<br/>(렌더 시작, ~150-300ms 후 첫 frame)
+```
+
+### 9.2 시크백 (HLS, EVENT playlist)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as Browser (hls.js)
+    participant N as nginx :8090
+    participant FS as /srv/dvr (SD)
+
+    Note over B: 페이지 로드 직후 즉시 attach<br/>(라이브 모드와 무관)
+    B->>N: GET /dvr.m3u8
+    N->>FS: read dvr.m3u8
+    FS-->>N: 7200 entries × (#EXTINF + PDT + seg_*.ts)
+    N-->>B: 200 OK (m3u8 body)<br/>+ Cache-Control: no-cache
+    B->>B: parse: EXT-X-PLAYLIST-TYPE=EVENT<br/>→ duration = 7200×2s = 4h<br/>→ seekable = [0, 4h]
+
+    Note over B: 사용자가 progress bar -50초 클릭
+    B->>B: video.currentTime = liveEdge - 50<br/>seeking event 발생
+    B->>B: enterSeekMode (liveVideo 숨김)
+    B->>N: GET /seg_YYYYMMDDTHHMMSS.ts<br/>(currentTime 포함하는 segment)
+    N-->>B: 200 OK (.ts payload)
+    B->>B: hls.js MSE에 fragment append → decode → play
+
+    Note over B: ffmpeg는 백그라운드에서 계속 새 segment 생성 중
+    B->>N: GET /dvr.m3u8 (refresh 매 ~hls_time)
+    N-->>B: 200 OK (entries +N개 더 추가됨)
+```
+
+### 9.3 시간이동 → 라이브 복귀
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant B as Browser
+    participant LV as liveVideo (WebRTC)
+    participant DV as dvrVideo (HLS)
+
+    Note over LV: WebRTC stream 활성 유지 (페이지 lifetime 동안)
+    Note over DV: HLS hls.js 활성 유지
+
+    U->>B: "실시간으로" 빨간 버튼 클릭
+    B->>LV: classList.remove("hidden")<br/>(z-index: 3 오버레이 다시 표시)
+    B->>B: suppressSeekOnce = true
+    B->>DV: currentTime = hls.liveSyncPosition
+    DV-->>B: seeking event 발생 (자기 자신 트리거)
+    B->>B: suppressSeekOnce 플래그로 무시
+    Note over B: enterSeekMode 호출 안 됨 → 라이브 모드 유지
+```
+
+### 9.4 보존 정책 cron tick
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CR as cron (10분 주기)
+    participant SH as dvr-cleanup.sh
+    participant FS as /srv/dvr
+    participant PY as trim_m3u8.py
+    participant FF as ffmpeg
+
+    CR->>SH: invoke as user rbpi3b
+    SH->>FS: find seg_*.ts -mmin +240 -delete
+    Note over FS: 4h 넘은 .ts 삭제됨
+    SH->>PY: trim_m3u8.py /srv/dvr/dvr.m3u8
+    PY->>FS: read dvr.m3u8 + stat seg_*.ts
+    PY->>FS: rewrite dvr.m3u8.tmp without missing entries
+    PY->>FS: os.replace(tmp, dvr.m3u8)  (atomic)
+    Note over FF: ffmpeg가 다음 segment 작성 시 append_list로 정상 이어짐
+```
+
+---
+
+## 10. Configuration deep-dive
+
+운영자가 옵션 한 줄을 바꾸기 전에 그 줄이 어디에 어떻게 작용하는지를 알 수 있도록.
+
+### 10.1 `rpicam-vid` 옵션별 의미 + 변경 시 결과
+
+```bash
+rpicam-vid -t 0 \                                       # 무한 캡처 (timeout 없음)
+  --width 1280 --height 720 \                           # 출력 해상도. IMX219 native 3280x2464에서 ISP가 다운스케일
+  --framerate 15 \                                      # 프레임레이트. 30/15/10/5 가능. RPi 3B는 15 권장
+  --codec h264 \                                        # 출력 코덱. h264 / mjpeg / yuv420 / libav
+  --profile baseline \                                  # I/P 프레임만. WebRTC 호환 (ADR #1)
+  --inline \                                            # 매 keyframe NAL 앞에 SPS/PPS inject (ADR #3)
+  --intra 30 \                                          # keyframe 간격 (FPS×2 = 2초 GOP, ADR #2)
+  --bitrate 1000000 \                                   # 1Mbps CBR. ISP-side rate control
+  -o -                                                  # stdout
+```
+
+| 옵션을 바꾸면 | 결과 |
+|---|---|
+| `--profile main` | B-frame 가능 → 비트레이트 효율 ↑, WebRTC 디코딩 약함 |
+| `--profile high` | 화질 ↑↑, WebRTC 디코딩 거의 실패 |
+| `--inline` 제거 | 첫 segment 외에는 디코드 실패 (`non-existing PPS`) |
+| `--intra 60` (4초 GOP) | hls_time 2와 안 맞음 → 시크 정확도 ↓ |
+| `--framerate 30` | LOAD ~3.5, 가용성 한계 |
+| `--bitrate 1500000` | 화질 ↑, 4h DVR 2.7GB |
+| `--codec yuv420` | ffmpeg가 인코딩 책임짐 → SW 인코딩 부담 ↑↑ (이전 시도 실패) |
+
+### 10.2 `ffmpeg` 옵션별 의미 (HLS muxer)
+
+```bash
+ffmpeg -loglevel warning -y \
+  -f h264 -i - \                                        # 입력: stdin에서 H.264 annex-B
+  -map 0:v -c:v copy \                                  # 비디오 stream copy (재인코딩 0)
+    -f hls \                                            # HLS muxer 선택
+    -hls_time 2 \                                       # segment 길이 (초)
+    -hls_list_size 0 \                                  # m3u8에 모든 segment 유지 (sliding 안 함)
+    -hls_playlist_type event \                          # EVENT — 시크 가능 timeline (ADR #4)
+    -hls_flags independent_segments+\                   # 매 segment 키프레임 시작 보장
+              program_date_time+\                       # PROGRAM-DATE-TIME 절대시각 태그
+              append_list \                             # ffmpeg 재시작 시 m3u8 이어쓰기
+    -strftime 1 \                                       # hls_segment_filename에서 strftime 사용
+    -hls_segment_filename \
+      /srv/dvr/seg_%Y%m%dT%H%M%S.ts \                   # 절대시각 파일명 (restart 충돌 회피)
+    /srv/dvr/dvr.m3u8 \                                 # 출력 1: HLS 파일
+  -map 0:v -c:v copy \                                  # 두 번째 출력 (같은 stream copy)
+    -f rtsp -rtsp_transport tcp \                       # RTSP push, TCP transport
+    rtsp://localhost:8554/cam                           # 출력 2: MediaMTX
+```
+
+| 옵션을 바꾸면 | 결과 |
+|---|---|
+| `-hls_time 1` | segment 길이 1초 → 라이브 지연 ↓, 파일 수 2배 |
+| `-hls_list_size 6` | m3u8에 마지막 6개만 → DVR 안 됨 (라이브 sliding) |
+| `-hls_playlist_type` 제거 | hls.js가 sliding live로 인식 → backward seek 차단 |
+| `program_date_time` 제거 | 시크 모드 시계 표시 안 됨 |
+| `append_list` 제거 | ffmpeg restart 시 m3u8을 0부터 다시 씀 → 과거 segment 유실 |
+| `-c:v libx264 -preset ultrafast` | SW 재인코딩, LOAD 5+ |
+
+### 10.3 `mediamtx.yml` 라인별
+
+```yaml
+logLevel: info                                          # debug / info / warn / error
+logDestinations: [stdout]                               # journalctl이 잡음
+
+hls: no                                                 # MediaMTX HLS server 비활성 (nginx가 처리)
+rtmp: no                                                # 사용 안 함 → 포트 1935 점유 안 함
+srt: no                                                 # 사용 안 함
+
+rtsp: yes
+rtspAddress: :8554                                      # localhost only로 좁히려면 127.0.0.1:8554
+rtspTransports: [tcp]                                   # UDP 비활성 (loopback이라 의미 없음)
+
+webrtc: yes
+webrtcAddress: :8889                                    # WHEP HTTP
+webrtcAdditionalHosts: [100.123.127.114]                # ICE candidate에 명시 광고 (ADR #5의 결정타)
+webrtcICEServers2: []                                   # STUN/TURN 사용 안 함 (Tailscale 환경)
+
+api: no                                                 # MediaMTX HTTP API 비활성 (운영 단순)
+metrics: no                                             # Prometheus exporter 비활성
+playback: no                                            # MediaMTX 자체 playback API 비활성
+
+paths:
+  cam:
+    source: publisher                                   # 외부 publisher (ffmpeg)가 push해서 채움
+```
+
+### 10.4 `nginx-dvr.conf` 핵심 directive
+
+```nginx
+server {
+  listen 8090 default_server;                           # IPv4. IPv6도 받으려면 [::]:8090
+  server_name _;
+  root /srv/dvr;
+
+  location = / { return 302 /player/; }                 # / 접속 시 player로 리다이렉트
+  location /player/ {
+    alias /srv/dvr/player/;
+    index index.html;
+    types {
+      text/html              html;
+      text/css               css;
+      application/javascript js;
+    }
+  }
+  location / {                                          # m3u8/.ts 직접 서빙
+    add_header Cache-Control "no-cache, no-store, must-revalidate";
+    add_header Access-Control-Allow-Origin *;
+    types {
+      application/vnd.apple.mpegurl m3u8;
+      video/mp2t                    ts;
+      text/vtt                      vtt;
+      image/jpeg                    jpg;
+    }
+    autoindex on;                                       # 디렉토리 탐색 (디버깅용, prod 시 off)
+  }
+}
+```
+
+| 디렉티브 | 효과 |
+|---|---|
+| `Cache-Control: no-cache` | 브라우저/CDN이 m3u8을 캐싱 안 함 (필수 — m3u8은 매 2초 갱신) |
+| `Access-Control-Allow-Origin: *` | 다른 origin에서 fetch 가능 (다중 호스팅 시 필요) |
+| `application/vnd.apple.mpegurl` | hls.js가 검증하는 mime — text/html이면 거부 |
+| `autoindex on` | `/seg_*.ts` 직접 list 가능 (디버깅 편의) |
+
+---
+
+## 11. Code walkthrough
+
+### 11.1 `src/stream_server.py` — supervisor
+
+핵심 루프:
+
+```python
+def run_pipeline():
+    rpicam = subprocess.Popen([              # 자식 1
+        "rpicam-vid", "-t", "0",
+        "--width", "1280", "--height", "720", "--framerate", "15",
+        "--codec", "h264", "--profile", "baseline",
+        "--inline", "--intra", "30", "--bitrate", "1000000", "-o", "-"
+    ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    ffmpeg = subprocess.Popen([              # 자식 2
+        "ffmpeg", "-loglevel", "warning", "-y", "-f", "h264", "-i", "-",
+        "-map", "0:v", "-c:v", "copy",
+            "-f", "hls", "-hls_time", "2", "-hls_list_size", "0",
+            "-hls_playlist_type", "event",
+            "-hls_flags", "independent_segments+program_date_time+append_list",
+            "-strftime", "1",
+            "-hls_segment_filename", "/srv/dvr/seg_%Y%m%dT%H%M%S.ts",
+            "/srv/dvr/dvr.m3u8",
+        "-map", "0:v", "-c:v", "copy",
+            "-f", "rtsp", "-rtsp_transport", "tcp",
+            "rtsp://localhost:8554/cam"
+    ], stdin=rpicam.stdout,                  # 핵심: rpicam의 stdout이 ffmpeg의 stdin
+       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    rpicam.stdout.close()                    # ffmpeg가 inherit 후 부모는 close (POSIX 관용구)
+    ffmpeg.wait()                            # ffmpeg가 죽으면 main loop가 재시작
+```
+
+설계 포인트:
+1. **rpicam.stdout.close()** — 부모 프로세스가 닫지 않으면 EOF 전달 안 됨. POSIX 파이프 관용구.
+2. **ffmpeg.wait() 단일 의존** — rpicam이 죽으면 ffmpeg도 stdin EOF로 자연 종료 → wait 빠져나옴 → 외부 루프가 둘 다 재시작.
+3. **단일 supervisor + 단일 unit** — systemd가 stream_server.py만 감시. 자식 둘은 stream_server.py가 책임.
+
+### 11.2 `web/player/index.html` — dual-`<video>` 토글
+
+핵심 함수 4개:
+
+```js
+// (a) WebRTC 시작 — 페이지 로드 시 1회
+async function startWebRTC() {
+  pc = new RTCPeerConnection({ iceServers: [] });
+  pc.addTransceiver("video", { direction: "recvonly" });
+  pc.ontrack = (ev) => {
+    liveVideo.srcObject = ev.streams[0];
+    liveVideo.play().catch(() => {});
+  };
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  // ICE gathering 완료까지 대기 (non-trickle WHEP)
+  await new Promise((res) => {
+    if (pc.iceGatheringState === "complete") return res();
+    const t = setTimeout(res, 1500);                  // 안전망
+    pc.addEventListener("icegatheringstatechange", () => {
+      if (pc.iceGatheringState === "complete") { clearTimeout(t); res(); }
+    });
+  });
+
+  const r = await fetch(WHEP_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/sdp" },
+    body: pc.localDescription.sdp,
+  });
+  if (!r.ok) throw new Error("WHEP " + r.status);
+  await pc.setRemoteDescription({ type: "answer", sdp: await r.text() });
+}
+
+// (b) HLS 시작 — 페이지 로드 시 1회 (영구 유지)
+function attachHLS() {
+  if (Hls.isSupported()) {
+    hls = new Hls({ backBufferLength: 60*60*4, maxBufferLength: 30 });
+    hls.loadSource(HLS_SRC);
+    hls.attachMedia(dvrVideo);
+  } else if (dvrVideo.canPlayType("application/vnd.apple.mpegurl")) {
+    dvrVideo.src = HLS_SRC;                            // Safari native HLS
+  }
+}
+
+// (c) 라이브 모드 진입 — liveVideo 표시 + dvrVideo를 라이브 끝으로
+function enterLiveMode() {
+  inLiveMode = true;
+  liveVideo.classList.remove("hidden");
+  const live = getLiveEdge();                          // hls.liveSyncPosition || seekable.end(0)
+  if (live !== null) {
+    suppressSeekOnce = true;                            // 자기 자신 트리거 무시
+    dvrVideo.currentTime = live;
+  }
+  dvrVideo.play().catch(() => {});
+}
+
+// (d) 시크 모드 진입 — liveVideo 숨김
+function enterSeekMode() {
+  if (!inLiveMode) return;
+  inLiveMode = false;
+  liveVideo.classList.add("hidden");
+}
+
+// 휴리스틱 — seeking 이벤트 디스패치
+dvrVideo.addEventListener("seeking", () => {
+  if (suppressSeekOnce) { suppressSeekOnce = false; return; }
+  const live = getLiveEdge();
+  if (live !== null && Math.abs(dvrVideo.currentTime - live) < 3) return;  // 라이브 ±3초
+  if (inLiveMode) enterSeekMode();
+});
+```
+
+핵심 디자인 (ADR #1~#8과 [POST-MORTEM #6](docs/POST-MORTEM.md#6-실시간으로-누른-후-시크-시-0001로-리셋) 결과물):
+
+| 원칙 | 코드 표현 |
+|---|---|
+| HLS는 destroy 안 함 | `attachHLS()` 1회만, `enterSeekMode`에서 unload 없음 |
+| WebRTC는 destroy 안 함 | `startWebRTC()` 1회만, 토글은 CSS class로 |
+| 자기 자신 트리거 시크 무시 | `suppressSeekOnce` flag |
+| 라이브 ±3초는 라이브 모드 유지 | seeking listener의 거리 체크 |
+
+---
+
+## 12. Security & threat model
+
+### 12.1 자산 (assets)
+
+| 자산 | 가치 | 위치 |
+|---|---|---|
+| 영상 컨텐츠 (라이브 + 4시간 DVR) | 사생활 / 재산 보호 | RPi `/srv/dvr/`, 클라이언트 메모리/디스플레이 |
+| 카메라 컨트롤 | 보안 카메라 노출 | RPi (현재 PTZ 없음) |
+| RPi 시스템 자체 | botnet/cryptojacking 표적 | RPi OS |
+
+### 12.2 위협 (STRIDE 요약)
+
+| 위협 | 표면 | 현재 대응 | 남은 위험 |
+|---|---|---|---|
+| **S**poofing — 누가 RPi인 척 영상 송출 | RTSP :8554 | localhost only (외부 접근 X) | RPi 침투 시 가능 |
+| **T**ampering — 영상 위변조 | DVR `seg_*.ts` 디스크 | OS 권한 (rbpi3b 소유) | root 침투 시 가능. 무결성 서명 없음 |
+| **R**epudiation — "내가 안 봤다" | 액세스 로그 | nginx access log + journalctl | 30일 후 logrotate로 삭제 |
+| **I**nformation disclosure — 무단 시청 | 8090, 8889 | **Tailscale ACL** (mesh VPN, ADR #7) | Tailscale 디바이스 도난 시 노출 |
+| **D**oS — 트래픽으로 service down | 8090, 8889 | nginx limit_req (미설정), MediaMTX rate limit (미설정) | 부분 노출 |
+| **E**levation — 카메라 → root | rpicam-vid 자식 | `User=rbpi3b` (non-root systemd) | Linux capabilities 미세화 가능 |
+
+### 12.3 강화 권장 (선택)
+
+```nginx
+# nginx-dvr.conf — Basic Auth 추가
+location / {
+  auth_basic "DVR";
+  auth_basic_user_file /etc/nginx/.htpasswd;
+  ...
+}
+# 생성: htpasswd -c /etc/nginx/.htpasswd <user>
+```
+
+```yaml
+# mediamtx.yml — WebRTC reader 인증
+authMethod: internal
+authInternalUsers:
+  - user: viewer
+    pass: <bcrypt hash>
+    permissions:
+      - action: read
+        path: cam
+```
+
+```bash
+# systemd 권한 좁히기 (camera-stream.service에 추가)
+[Service]
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/srv/dvr
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+```
+
+### 12.4 데이터 라이프사이클
+
+```
+캡처 → SD에 4h 저장 → cron 삭제
+            │
+            └── 백업 X (현재 정책)
+            
+클라이언트 수신 → 브라우저 메모리/MSE buffer
+            │
+            └── 디스크 X (브라우저 캐시 외)
+```
+
+장기 보관이 필요하면:
+- `rsync /srv/dvr/ <backup-host>:/backup/` cron (지속 미러링)
+- 또는 `ffmpeg -i 'concat:seg_*.ts' -c copy backup-YYYYMMDD.mp4` (일별 묶음)
+
+---
+
+## 13. Networking deep-dive
+
+### 13.1 토폴로지 (현재 환경)
+
+```
+[X13 ThinkPad]                                [Phone]
+  Tailscale 100.125.10.87                      Tailscale 100.x.x.x
+        │                                            │
+        │  Wi-Fi 2.4GHz / Ethernet                   │  LTE / 5G / 외부 Wi-Fi
+        ▼                                            ▼
+  큰 공유기 (192.168.219.x)                    SK/KT/LGU+ NAT
+        │                                            │
+        ▼                                            │
+  작은 공유기 WAN: 192.168.219.107                   │
+        │ LAN 192.168.0.x                            │
+        │                                            │
+        └─── 192.168.0.13 (RPi 3B)                   │
+              Tailscale 100.123.127.114 ◄────────────┘
+              (NAT 통과 P2P direct, DERP 미경유)
+```
+
+X13에서 RPi의 LAN IP `192.168.0.13`은 직접 ping 안 됨 (NAT 두 단계). **모든 트래픽은 Tailscale 100.x.x.x 경유**.
+
+### 13.2 Tailscale이 STUN/TURN을 대체하는 방식
+
+Tailscale 자체가 ICE-like NAT 통과 (WireGuard-based). 동작 흐름:
+
+```mermaid
+sequenceDiagram
+    participant A as 클라이언트 tailscaled
+    participant CP as Tailscale Control Plane
+    participant B as RPi tailscaled
+
+    A->>CP: 내 endpoints (LAN+공인IP) 보고
+    B->>CP: 내 endpoints 보고
+    A->>CP: B의 endpoints 요청
+    CP-->>A: B의 endpoints 응답 (stable)
+    A->>B: WireGuard handshake (UDP 41641 시도)
+    B-->>A: handshake (NAT hole punch 성공 시 direct)
+    Note over A,B: Direct mode. STUN 불필요.
+    
+    alt Direct 실패 (UDP 차단)
+        A->>CP: DERP relay 요청
+        CP-->>A: relay endpoint
+        A--xB: via DERP (TCP 443, 속도 ↓)
+    end
+```
+
+따라서 본 시스템에선:
+- WebRTC ICE candidate가 Tailscale IP 100.x.x.x를 광고 (`webrtcAdditionalHosts`)
+- Tailscale가 NAT 통과를 책임 → STUN/TURN 서버 불필요
+- 다만 Tailscale가 DERP relay로 폴백하면 WebRTC 지연 ↑ (1초 정도)
+
+### 13.3 대역 측정
+
+| Path | 평균 | 측정법 |
+|---|---|---|
+| ffmpeg → MediaMTX (RTSP TCP, loopback) | ~1 Mbps | `iftop -i lo` |
+| RPi → 클라이언트 (HLS .ts download) | ~1 Mbps (segment 받는 순간 burst, 평균 1Mbps) | nginx access log + 시간 |
+| RPi → 클라이언트 (WebRTC SRTP) | ~1 Mbps + RTCP overhead | `pc.getStats()` `bytesReceived` 추세 |
+| 합계 (한 클라이언트가 둘 다 받음) | ~2 Mbps | 위 둘 합 |
+
+100 Mbps 이더넷 / 2.4GHz Wi-Fi (~50 Mbps 실효)면 **이론상 25명 동시 접속**. 실측은 5명까지 안정 검증.
+
+### 13.4 방화벽 / 라우터 요건
+
+```bash
+# RPi에서 listening해야 하는 포트
+sudo ss -tlnp | grep -E ':(8090|8554|8889)'             # TCP
+sudo ss -ulnp | grep ':8189'                             # UDP
+
+# 외부 노출 필요 (Tailscale 경유):
+#   8090/TCP (HLS)
+#   8889/TCP (WHEP signaling)
+#   8189/UDP (WebRTC media)
+# 8554는 localhost only.
+
+# Tailscale ACL 예시 (관리자가 admin console에서)
+# {"action": "accept", "src": ["group:home"], "dst": ["100.123.127.114:8090,8889,8189"]}
+```
+
+---
+
+## 14. Migration guides
+
+### 14.1 RPi 3B → RPi 4 (4GB+)
+
+차이점:
+- CPU 1.5GHz Cortex-A72 (3B의 ~2배)
+- USB 3.0 → SSD 마운트 가능
+- Gigabit Ethernet
+- H.264 HW 인코더 동일 (bcm2835)
+
+마이그레이션:
+```bash
+# 1. SD 그대로 옮기면 부팅 가능 (kernel 호환)
+# 2. /etc/mediamtx/mediamtx.yml의 webrtcAdditionalHosts 업데이트
+sudo sed -i "s|<old-tailscale>|$(tailscale ip -4)|" /etc/mediamtx/mediamtx.yml
+
+# 3. 기회: 더 높은 사양으로 변경
+# rpicam-vid: --framerate 30 --bitrate 2000000
+# ffmpeg: -hls_time 2 그대로 (or 1로 낮춰 지연 ↓)
+
+# 4. SSD 마운트 + DVR 보존 24h로 확장
+sudo mount /dev/sda1 /srv/dvr-ssd
+sudo sed -i "s|/srv/dvr|/srv/dvr-ssd|g" /etc/systemd/system/camera-stream.service
+sudo sed -i 's/RETAIN_HOURS:-4/RETAIN_HOURS:-24/' /usr/local/bin/dvr-cleanup.sh
+```
+
+### 14.2 RPi 3B → RPi 5
+
+차이점:
+- Cortex-A76 4코어 2.4GHz
+- **H.264 HW 인코더 제거됨** — SW libx264 또는 Hailo HAT
+- NVMe HAT 가능 (PCIe Gen2 ×1)
+- 12W idle, 27W peak — **액티브 쿨러 필수**
+
+마이그레이션:
+```bash
+# rpicam-vid: --codec yuv420 출력 → ffmpeg가 인코딩
+# 또는: rpicam-vid가 내장 ffmpeg(libav)로 H.264 인코딩하지만 SW libx264 → 부담 큼
+
+# stream_server.py 수정안 (RPi 5):
+rpicam-vid --width 1920 --height 1080 --framerate 30 \
+  --codec yuv420 -o - | \
+ffmpeg -f rawvideo -pix_fmt yuv420p -s 1920x1080 -framerate 30 -i - \
+  -c:v libx264 -preset ultrafast -tune zerolatency \
+  -g 60 -b:v 3000000 -profile:v baseline \
+  -f hls ...
+```
+
+LL-HLS로 격상 가능 (RPi 5 권장):
+```bash
+ffmpeg ... \
+  -hls_segment_type fmp4 \
+  -hls_fmp4_init_filename init.mp4 \
+  -hls_flags ...+iframes_only_playlist
+# .ts → .m4s 전환 → cleanup.sh 패턴 변경 필요
+```
+
+### 14.3 RPi → Jetson Nano / Orin
+
+장점:
+- NVENC HW 인코더 (RPi 5보다 강함)
+- AI 추론 동시 가능 (YOLOv8 등)
+
+캡처 단:
+- libcamera 안 됨 → GStreamer + nvarguscamerasrc
+- ffmpeg 입력: `gst-launch ... ! ... appsink` 또는 v4l2
+
+```bash
+# 예시 (Jetson Orin Nano + IMX219)
+gst-launch-1.0 nvarguscamerasrc ! \
+  'video/x-raw(memory:NVMM),width=1920,height=1080,framerate=30/1' ! \
+  nvvidconv ! 'video/x-raw,format=I420' ! \
+  x264enc tune=zerolatency bitrate=2000 key-int-max=60 ! \
+  h264parse config-interval=1 ! \
+  rtspclientsink location=rtsp://localhost:8554/cam protocols=tcp
+```
+
+`config-interval=1`이 inline SPS/PPS 동등 (ADR #3과 같은 효과).
+
+### 14.4 보존 시간 / 비트레이트 변경
+
+`scripts/dvr-cleanup.sh`의 `RETAIN_HOURS`:
+```bash
+# 1h → 4h → 12h → 24h 단계별
+sudo sed -i 's/RETAIN_HOURS:-[0-9]\+/RETAIN_HOURS:-12/' /usr/local/bin/dvr-cleanup.sh
+df -h /srv/dvr   # 추정 사용량: 12h × 1Mbps × 3600/8 = 5.4GB
+```
+
+`stream_server.py`의 `--bitrate`:
+```bash
+sudo sed -i 's/"--bitrate", "1000000"/"--bitrate", "1500000"/' /home/$USER/stream_server.py
+sudo systemctl restart camera-stream
+ffprobe -v error -show_entries format=bit_rate $(ls -t /srv/dvr/seg_*.ts | head -1)
+```
+
+---
+
+## 15. API reference
+
+### 15.1 WHEP endpoint (MediaMTX)
+
+#### `POST /cam/whep`
+
+WebRTC reader 협상.
+
+| | |
+|---|---|
+| Method | POST |
+| URL | `http://<host>:8889/cam/whep` |
+| Request Content-Type | `application/sdp` |
+| Request body | SDP offer (recvonly) |
+| Response status | `201 Created` |
+| Response Content-Type | `application/sdp` |
+| Response body | SDP answer with ICE candidates |
+| Response Location | `/cam/whep/<sessionId>` (DELETE 용) |
+
+```bash
+# 수동 테스트
+SDP=$(cat <<'EOF'
+v=0
+o=- 0 0 IN IP4 127.0.0.1
+...                    # 표준 WebRTC offer
+EOF
+)
+curl -i -X POST http://100.123.127.114:8889/cam/whep \
+  -H "Content-Type: application/sdp" \
+  --data "$SDP"
+```
+
+#### `DELETE /cam/whep/<sessionId>`
+
+세션 종료.
+
+### 15.2 nginx 정적 endpoint
+
+| Path | Method | 응답 |
+|---|---|---|
+| `/dvr.m3u8` | GET | HLS playlist (text/vnd.apple.mpegurl) |
+| `/seg_*.ts` | GET | HLS segment (video/mp2t) |
+| `/thumbs/thumbs.vtt` | GET | WebVTT (현재 placeholder) |
+| `/player/` | GET | 플레이어 SPA |
+| `/` | GET | 302 → `/player/` |
+
+### 15.3 RTSP endpoint (localhost only)
+
+| | |
+|---|---|
+| URL | `rtsp://localhost:8554/cam` |
+| Transport | TCP (`-rtsp_transport tcp`) |
+| Auth | 없음 (localhost only) |
+| Tracks | 1 video (H.264 baseline) |
+
+```bash
+# VLC 또는 ffprobe로 검증 (RPi 내부에서)
+ffprobe -v error -show_streams rtsp://localhost:8554/cam
+```
+
+### 15.4 systemd unit 인터페이스
+
+```bash
+sudo systemctl status camera-stream        # State, recent log
+sudo systemctl restart camera-stream       # ffmpeg + rpicam-vid 재시작
+sudo systemctl stop camera-stream          # DVR 일시 중단
+sudo journalctl -u camera-stream -f        # tail follow
+sudo systemctl edit camera-stream          # override.conf 만들기
+```
+
+---
+
+## 16. Documentation map
 
 처음 본다면 **순서대로 읽으면 자연스럽다**.
 
@@ -548,7 +1238,7 @@ echo 'RETAIN_HOURS=1' | sudo tee -a /etc/cron.d/dvr-cleanup
 
 ---
 
-## 10. Roadmap & status
+## 17. Roadmap & status
 
 ### 10.1 완료 (2026-05-03 기준)
 
@@ -566,7 +1256,7 @@ echo 'RETAIN_HOURS=1' | sudo tee -a /etc/cron.d/dvr-cleanup
 
 ---
 
-## 11. Risk register
+## 18. Risk register
 
 | 리스크 | 영향 | 관측 가능성 | 완화책 |
 |---|---|---|---|
@@ -581,7 +1271,7 @@ echo 'RETAIN_HOURS=1' | sudo tee -a /etc/cron.d/dvr-cleanup
 
 ---
 
-## 12. Related projects & OSS NVR comparison
+## 19. Related projects & OSS NVR comparison
 
 이 프로젝트는 [Multi-Board-Viewer](https://github.com/squid55/Multi-Board-Viewer)의 자매 프로젝트로, 라즈베리파이 카메라 노드에 한정된 **DVR + WebRTC** 레이어를 추가합니다. 멀티보드 뷰어 없이 단독으로 동작합니다.
 
@@ -599,7 +1289,69 @@ echo 'RETAIN_HOURS=1' | sudo tee -a /etc/cron.d/dvr-cleanup
 
 ---
 
-## 13. License & contributing
+## 20. Glossary
+
+| 용어 | 정의 |
+|---|---|
+| **HLS** | HTTP Live Streaming. .m3u8 플레이리스트 + .ts/.m4s segment 파일을 HTTP로 다운로드하는 적응형 스트리밍 프로토콜. RFC 8216. |
+| **DVR window** | HLS playlist에 등재된 모든 segment의 시간 합. 본 시스템에선 4시간. |
+| **EVENT playlist** | `EXT-X-PLAYLIST-TYPE:EVENT` 태그가 있는 m3u8. append-only timeline + 시크 가능. |
+| **VOD playlist** | `EXT-X-PLAYLIST-TYPE:VOD` + `EXT-X-ENDLIST` — 완료된 영상. 새 segment append 안 됨. |
+| **LL-HLS** | Low-Latency HLS. fMP4 part 단위로 1초 미만 지연. Apple WWDC 2020. |
+| **WebRTC** | 브라우저 P2P 실시간 미디어/데이터. UDP/SRTP 기반. RFC 8825. |
+| **WHEP** | WebRTC-HTTP Egress Protocol. 단방향 reader가 SDP를 HTTP POST로 협상. IETF draft. |
+| **WHIP** | WebRTC-HTTP Ingestion Protocol. publisher 측. 본 시스템은 ffmpeg가 RTSP push라 WHIP 사용 X. |
+| **SDP** | Session Description Protocol. WebRTC가 미디어 설명을 교환할 때 쓰는 텍스트 포맷. RFC 8866. |
+| **ICE** | Interactive Connectivity Establishment. WebRTC가 P2P 경로를 찾는 협상. RFC 8445. |
+| **STUN** | Session Traversal Utilities for NAT. 공인 IP/포트 알아냄. RFC 5389. |
+| **TURN** | Traversal Using Relays around NAT. ICE 실패 시 미디어 릴레이. RFC 5766. |
+| **SRTP** | Secure RTP. RTP의 암호화 변형. WebRTC 미디어 전송에 사용. RFC 3711. |
+| **RTSP** | Real-Time Streaming Protocol. 미디어 서버 ↔ 클라이언트 제어. 본 시스템은 ffmpeg → MediaMTX 내부 push에만 사용. RFC 7826. |
+| **GOP** | Group of Pictures. 한 키프레임부터 다음 키프레임 직전까지. HLS segment 시작은 GOP 시작과 일치. |
+| **SPS / PPS** | Sequence/Picture Parameter Set. H.264 NAL 단위. 디코더 초기화에 필요. 매 keyframe 앞에 있어야 segment 단위 디코드 가능. |
+| **NAL** | Network Abstraction Layer unit. H.264 stream의 기본 단위. |
+| **annex-B** | H.264 elementary stream 포맷. NAL 사이를 `0x000001` 시작 코드로 구분. rpicam-vid의 H.264 출력 포맷. |
+| **MSE** | Media Source Extensions. JS에서 video element에 동적으로 fragment를 append하는 W3C API. hls.js의 backend. |
+| **MediaMTX** | RTSP/RTMP/SRT/HLS/WebRTC를 단일 데몬으로 라우팅하는 미디어 서버. 본 시스템은 RTSP→WebRTC 변환만 사용. |
+| **WebVTT** | Web Video Text Tracks. 자막/썸네일 트랙 포맷. W3C. 본 시스템은 Phase 2에서 썸네일에 사용 예정. |
+| **MagicDNS** | Tailscale의 호스트네임 자동 해상. `<machine>.<tailnet>.ts.net`. |
+| **DERP** | Designated Encrypted Relay for Packets. Tailscale의 fallback relay (P2P 실패 시 TCP). |
+| **Tailnet** | Tailscale의 단일 mesh VPN 네트워크 단위. ACL은 tailnet 내에서 정의. |
+| **Cortex-A53/A72/A76** | ARM CPU 코어. RPi 3B는 A53 (in-order), 4는 A72, 5는 A76 (out-of-order, 2× 성능). |
+| **v4l2m2m** | Video4Linux2 mem2mem. 커널의 HW codec 인터페이스. RPi 3B의 H.264 인코더 접근에 사용. |
+| **rpicam-apps** | libcamera 기반 RPi 공식 카메라 도구 모음. `libcamera-apps`의 후속명. |
+| **bcm2835-codec** | RPi 3B의 VideoCore IV가 노출하는 v4l2 인코더/디코더 디바이스 (`/dev/video10..18`). |
+
+---
+
+## 21. Changelog
+
+### v0.1.0 — 2026-05-03
+
+**Initial implementation.** RPi 3B + IMX219 + Trixie aarch64 위에서 측정 완료.
+
+- **Pipeline**: rpicam-vid (H.264 baseline, `--inline`, 2s GOP, 1Mbps) → ffmpeg (`-c:v copy` fan-out) → HLS DVR + RTSP push
+- **DVR**: HLS event playlist, 4h cron retention, `seg_<strftime>.ts` 절대시각 파일명
+- **Live**: MediaMTX v1.18.1 → WebRTC (WHEP) over Tailscale, ~0.2s 지연
+- **Player**: dual-`<video>` 토글 (hls.js 영구 attach + RTCPeerConnection 오버레이) — 시크 위치 보존
+- **Measured**: LOAD ~1.8 (4코어), RAM ~470MB, 4h DVR ~1.8GB on SD
+- **Docs**: ARCHITECTURE / STACK / INSTALL / SETUP-GUIDE / CONCEPTS / HARDWARE / IMPLEMENTATION-PLAN / TROUBLESHOOTING / POST-MORTEM / REFERENCES
+
+### Pre-release — 2026-05-02
+
+- Planning docs (CONCEPTS, HARDWARE, SETUP-GUIDE, IMPLEMENTATION-PLAN, REFERENCES) merged
+- Repo created on GitHub (`squid55/rpi-camera-dvr`)
+
+### Upcoming (planned)
+
+- v0.2.0 — Phase 2 썸네일 호버 (WebVTT + ImageMagick montage)
+- v0.3.0 — Phase 4 PWA manifest + service worker
+- v0.4.0 — Phase 5 AI 이벤트 마커 (Jetson Orin YOLOv8 webhook)
+- v1.0.0 — Phase 6 RPi 5 + LL-HLS + NVMe HAT + 듀얼 IMX219
+
+---
+
+## 22. License & contributing
 
 본 저장소: **[MIT](LICENSE)**.
 
