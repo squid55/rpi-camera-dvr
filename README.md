@@ -1,48 +1,48 @@
 # RPi Camera DVR
 
-Add **Twitch / YouTube-Live class DVR (time-shift) playback** to a Raspberry Pi IP camera (IMX219 / Pi Camera Module).
+라즈베리파이 IP카메라(IMX219 / Pi Camera Module)에 **치지직 / 트위치 / 유튜브 라이브 수준의 DVR(타임머신) 재생** 기능을 추가하는 프로젝트.
 
-Watch live on a phone, drag the seek bar left to scrub back to broadcast start (or last N hours), hover for thumbnail preview, tap **LIVE** to snap to the edge — the same UX as Chzzk / Twitch / YouTube Live, served entirely off-grid from a Raspberry Pi with SD-card storage.
+휴대폰으로 라이브를 보다가 시크바를 왼쪽으로 끌면 방송 시작 시점(또는 최근 N시간)까지 되돌려 볼 수 있고, 호버 시 썸네일 미리보기, **"실시간"** 버튼 한 번이면 라이브로 복귀 — 즉 치지직과 동일한 UX를 라즈베리파이 한 대로, SD카드 저장 기반으로 구현.
 
 ```
-[IMX219] → [RPi] → ffmpeg HLS muxer → SD card (.ts segments + thumbs)
+[IMX219] → [RPi] → ffmpeg HLS muxer → SD카드 (.ts 세그먼트 + 썸네일)
                           │
                           ▼
                        nginx (:8090)
                           │
                           ▼
-                Phone (hls.js + Plyr, via Tailscale)
+                휴대폰 (hls.js + Plyr, Tailscale 경유)
 ```
 
-## Status
+## 진행 상태
 
-**2026-05-02 — Planning.** Specification and roadmap done. Implementation not started.
+**2026-05-02 — 기획 단계.** 사양과 로드맵 작성 완료. 구현 착수 전.
 
-See **[docs/IMPLEMENTATION-PLAN.md](docs/IMPLEMENTATION-PLAN.md)** for full details: architecture, ffmpeg pipelines for RPi 3B (HW H.264) and RPi 5 (SW libx264), LL-HLS configuration, WebVTT thumbnail sprite generation, SD-card retention policy, the 6-phase roadmap, and a curated reference list (RFC 8216, Apple LL-HLS, hls.js / Plyr, plus academic surveys on HTTP adaptive streaming).
+상세 내용은 **[docs/IMPLEMENTATION-PLAN.md](docs/IMPLEMENTATION-PLAN.md)** 참고: 시스템 아키텍처, RPi 3B(HW H.264) / RPi 5(SW libx264) 별 ffmpeg 파이프라인, LL-HLS 설정, WebVTT 썸네일 스프라이트 생성, SD카드 보존 정책, 6단계 로드맵, 그리고 표준 문서 + 학술 논문 레퍼런스(RFC 8216, Apple LL-HLS, hls.js / Plyr, HTTP adaptive streaming 서베이 등).
 
-## Open decisions
+## 결정해야 할 사항
 
-- [ ] Board: RPi 3B (720p / 4 h retention) or wait for RPi 5 (1080p / 24 h+)
-- [ ] Retention window: 1 h / 4 h / 24 h / since-broadcast-start
-- [ ] Recording trigger: always-on while booted, or phone "Start broadcast" button
-- [ ] Player: hls.js + Plyr (default) / video.js / Shaka
-- [ ] LL-HLS on or off
-- [ ] Storage: SD only / SD + USB SSD or NVMe HAT
-- [ ] Auth: Tailscale-only / explicit token
+- [ ] 보드: RPi 3B(720p / 4시간 보존)로 시작 vs RPi 5(1080p / 24시간+) 도착 대기
+- [ ] 보존 시간: 1시간 / 4시간 / 24시간 / 방송 시작부터 누적
+- [ ] 녹화 트리거: ① 부팅 후 항상 녹화 / ② 휴대폰의 "방송 시작" 버튼
+- [ ] 플레이어: hls.js + Plyr (기본 후보) / video.js / Shaka
+- [ ] LL-HLS 적용 여부
+- [ ] 저장 매체: SD only / SD + USB SSD or NVMe HAT
+- [ ] 인증: Tailscale only / 별도 토큰
 
-## Roadmap (high level)
+## 로드맵 요약
 
-1. **MVP** — libcamera-vid → ffmpeg HLS → nginx → static hls.js player. Phone seeks back 1 h.
-2. **Thumbnail hover** — WebVTT sprite track.
-3. **Retention** — cron cleanup, SD usage monitoring.
-4. **UX polish** — LIVE badge, absolute clock, PWA install.
-5. **(optional) AI event markers** — Jetson Orin YOLOv8 → webhook → seekbar markers.
-6. **(optional) RPi 5 migration** — 1080p30 LL-HLS, NVMe HAT, dual IMX219.
+1. **MVP** — libcamera-vid → ffmpeg HLS → nginx → 정적 hls.js 페이지. 휴대폰에서 1시간 전 시크 동작.
+2. **썸네일 호버** — WebVTT 스프라이트 트랙.
+3. **보존 정책** — cron 정리, SD 사용량 모니터링.
+4. **UX 마감** — LIVE 배지, 절대 시각, PWA 설치.
+5. **(선택) AI 이벤트 마커** — Jetson Orin YOLOv8 → webhook → 시크바 마커.
+6. **(선택) RPi 5 마이그레이션** — 1080p30 LL-HLS, NVMe HAT, 듀얼 IMX219.
 
-## Related
+## 관련 프로젝트
 
-This project is a sibling to [Multi-Board-Viewer](https://github.com/squid55/Multi-Board-Viewer); it adds a DVR layer specific to the Raspberry Pi camera node and does not depend on the multiboard viewer to run.
+이 프로젝트는 [Multi-Board-Viewer](https://github.com/squid55/Multi-Board-Viewer)의 자매 프로젝트로, 라즈베리파이 카메라 노드에 한정된 DVR 레이어를 추가합니다. 멀티보드 뷰어 없이 단독으로 동작합니다.
 
-## License
+## 라이선스
 
-TBD.
+미정.
