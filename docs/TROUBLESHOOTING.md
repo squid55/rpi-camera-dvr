@@ -144,16 +144,19 @@ htop
 - `trim_m3u8.py`로 m3u8과 디스크를 동기화시켜야 한다.
 - 임시 해결: cron 정리 주기를 늘리거나(예: 10분 → 30분) 보존 시간 + 5분 마진을 둔다.
 
-### 3.3 LIVE 버튼을 눌러도 라이브로 안 감
+### 3.3 LIVE 버튼을 눌러도 라이브로 안 감 / 시크바를 끌어도 라이브로 강제 복귀
 
 `hls.liveSyncPosition`이 `NaN`이면 라이브가 아닌 VOD로 인식됐다는 뜻.
 - 플레이리스트에 `#EXT-X-PLAYLIST-TYPE:VOD` 가 들어있으면 안 됨
 - `#EXT-X-ENDLIST` 가 있으면 라이브가 끝났다고 판단
+- 반대로 `EXT-X-PLAYLIST-TYPE` 자체가 **누락**되면 hls.js가 sliding window로 보고 backward seek을 막아버림 → DVR이 안 됨
 
 ```bash
 grep -E "PLAYLIST-TYPE|ENDLIST" /srv/dvr/dvr.m3u8
 ```
-둘 다 나오면 안 된다. 나오면 ffmpeg 옵션에 `-hls_playlist_type` 가 잘못 들어간 것.
+DVR이 의도면 `#EXT-X-PLAYLIST-TYPE:EVENT` 한 줄이 있어야 한다. `VOD` 또는 `ENDLIST`가 같이 나오면 안 됨. ffmpeg 옵션에 `-hls_playlist_type event` 명시.
+
+> 본 빌드 사례: [`POST-MORTEM.md` §3](POST-MORTEM.md#3-시크백-시-라이브-위치로-강제-복귀) — 시크바를 -50초로 끌어도 -3초로 자동 복귀하던 증상.
 
 ### 3.4 라이브 지연이 너무 크다 (10초 이상)
 

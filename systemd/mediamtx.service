@@ -1,0 +1,14 @@
+[Unit]
+Description=MediaMTX media server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/mediamtx /etc/mediamtx/mediamtx.yml
+Restart=always
+RestartSec=5
+User=root
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

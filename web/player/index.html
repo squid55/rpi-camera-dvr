@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>RPi 3B DVR</title>
+  <link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css">
+  <style>
+    html,body { margin:0; padding:0; background:#000; color:#eee;
+                font-family:-apple-system,system-ui,sans-serif;
+                height:100%; overflow:hidden; }
+    .wrap { display:flex; flex-direction:column; height:100vh;
+            height:100dvh; }
+    .player-box { flex:1; position:relative; min-height:0; overflow:hidden; }
+    #dvrVideo { width:100%; height:100%; object-fit:contain; background:#000; }
+    /* Plyr가 wrapping하면서 강제하는 16:9 padding 무력화 */
+    .player-box .plyr,
+    .player-box .plyr--video {
+      width:100% !important; height:100% !important;
+      max-height:100% !important;
+    }
+    .player-box .plyr__video-wrapper {
+      height:100% !important; padding-bottom:0 !important;
+    }
+    .player-box .plyr video {
+      width:100% !important; height:100% !important;
+      object-fit:contain !important;
+    }
+    .live-overlay { position:absolute; left:0; top:0; width:100%; height:100%;
+                    object-fit:contain; background:#000; z-index:3;
+                    pointer-events:none; }
+    .live-overlay.hidden { display:none; }
+    .topbar { position:absolute; top:8px; left:8px; right:8px; display:flex;
+              justify-content:space-between; align-items:center;
+              pointer-events:none; z-index:20; }
+    .badge { background:rgba(0,0,0,0.55); padding:4px 10px; border-radius:14px;
+             font-size:13px; pointer-events:auto; }
+    .live-on  { background:#e0254a; color:#fff; font-weight:700; }
+    .live-off { background:rgba(0,0,0,0.55); color:#bbb; }
+    .clock    { background:rgba(0,0,0,0.55); color:#ddd;
+                font-variant-numeric:tabular-nums; }
+    .live-btn { position:absolute; right:14px; bottom:84px; z-index:25;
+                background:#e0254a; color:#fff; border:none;
+                padding:8px 14px; border-radius:18px; font-weight:700;
+                box-shadow:0 2px 8px rgba(0,0,0,0.4);
+                cursor:pointer; display:none; }
+    .live-btn.show { display:block; }
+    .err { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+           color:#f88; font-size:14px; z-index:15; pointer-events:none;
+           text-shadow:0 1px 4px #000; display:none; }
+    .err.show { display:block; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="player-box">
+      <div class="topbar">
+        <span id="liveBadge" class="badge live-off">대기</span>
+        <span id="clock"     class="badge clock">--:--:--</span>
+      </div>
+      <video id="dvrVideo"  controls crossorigin playsinline muted autoplay></video>
+      <video id="liveVideo" class="live-overlay" autoplay muted playsinline></video>
+      <div   id="errMsg" class="err"></div>
+      <button id="liveBtn" class="live-btn">실시간으로</button>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+  <script src="https://cdn.plyr.io/3.7.8/plyr.js"></script>
+  <script>
+    const HLS_SRC  = "/dvr.m3u8";
+    const WHEP_URL = "http://" + location.hostname + ":8889/cam/whep";
+
+    const dvrVideo  = document.getElementById("dvrVideo");
+    const liveVideo = document.getElementById("liveVideo");
+    const liveBadge = document.getElementById("liveBadge");
+    const liveBtn   = document.getElementById("liveBtn");
+    const clockEl   = document.getElementById("clock");
+    const errMsg    = document.getElementById("errMsg");
+
+    const player = new Plyr(dvrVideo, {
+      controls: ["play","progress","current-time","mute","volume","settings","pip","fullscreen"]
+    });
+
+    let pc = null;
+    let hls = null;
+    let inLiveMode = true;
+    let suppressSeekOnce = false;
+
+    function showErr(m) {
+      errMsg.textContent = m;
+      errMsg.classList.toggle("show", !!m);
+    }
+
+    function getLiveEdge() {
+      if (hls && hls.liveSyncPosition) return hls.liveSyncPosition;
+      if (dvrVideo.seekable.length) return dvrVideo.seekable.end(0);
+      return null;
+    }
+
+    if (Hls.isSupported()) {
+      hls = new Hls({
+        backBufferLength: 60 * 60 * 4,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60
+      });
+      hls.loadSource(HLS_SRC);
+      hls.attachMedia(dvrVideo);
+    } else if (dvrVideo.canPlayType("application/vnd.apple.mpegurl")) {
+      dvrVideo.src = HLS_SRC;
+    }
+
+    async function startWebRTC() {
+      if (pc) return;
+      pc = new RTCPeerConnection({ iceServers: [] });
+      pc.addTransceiver("video", { direction: "recvonly" });
+      pc.ontrack = (ev) => {
+        liveVideo.srcObject = ev.streams[0];
+        liveVideo.play().catch(() => {});
+      };
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await new Promise((res) => {
+        if (pc.iceGatheringState === "complete") return res();
+        const t = setTimeout(res, 1500);
+        pc.addEventListener("icegatheringstatechange", () => {
+          if (pc.iceGatheringState === "complete") {
+            clearTimeout(t); res();
+          }
+        });
+      });
+      const r = await fetch(WHEP_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/sdp" },
+        body: pc.localDescription.sdp
+      });
+      if (!r.ok) throw new Error("WHEP " + r.status);
+      const answer = await r.text();
+      await pc.setRemoteDescription({ type: "answer", sdp: answer });
+    }
+
+    function enterLiveMode() {
+      inLiveMode = true;
+      liveVideo.classList.remove("hidden");
+      const live = getLiveEdge();
+      if (live !== null) {
+        suppressSeekOnce = true;
+        dvrVideo.currentTime = live;
+      }
+      dvrVideo.play().catch(() => {});
+    }
+
+    function enterSeekMode() {
+      if (!inLiveMode) return;
+      inLiveMode = false;
+      liveVideo.classList.add("hidden");
+    }
+
+    dvrVideo.addEventListener("seeking", () => {
+      if (suppressSeekOnce) {
+        suppressSeekOnce = false;
+        return;
+      }
+      const live = getLiveEdge();
+      if (live !== null && Math.abs(dvrVideo.currentTime - live) < 3) {
+        return;
+      }
+      if (inLiveMode) enterSeekMode();
+    });
+
+    dvrVideo.addEventListener("pause", () => {
+      if (dvrVideo.ended) return;
+      if (inLiveMode) enterSeekMode();
+    });
+
+    liveBtn.onclick = () => { enterLiveMode(); };
+
+    startWebRTC().catch((e) => {
+      console.error("WebRTC failed:", e);
+      showErr("WebRTC 실패 - HLS 라이브로 폴백");
+      liveVideo.classList.add("hidden");
+      const live = getLiveEdge();
+      if (live !== null) {
+        suppressSeekOnce = true;
+        dvrVideo.currentTime = live;
+      }
+    });
+
+    function tick() {
+      const isLive = inLiveMode && !liveVideo.classList.contains("hidden");
+      liveBadge.classList.toggle("live-on", isLive);
+      liveBadge.classList.toggle("live-off", !isLive);
+      liveBadge.textContent = isLive ? "LIVE (WebRTC)" : "시간이동";
+      liveBtn.classList.toggle("show", !inLiveMode);
+
+      if (inLiveMode) {
+        clockEl.textContent =
+          new Date().toLocaleTimeString("ko-KR", { hour12: false });
+      } else if (hls) {
+        const f = hls.streamController && hls.streamController.fragCurrent;
+        if (f && f.programDateTime) {
+          const t = new Date(
+            f.programDateTime + (dvrVideo.currentTime - f.start) * 1000
+          );
+          clockEl.textContent =
+            t.toLocaleTimeString("ko-KR", { hour12: false });
+        }
+      }
+    }
+    setInterval(tick, 500);
+  </script>
+</body>
+</html>

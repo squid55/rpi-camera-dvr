@@ -1,0 +1,13 @@
+[Unit]
+Description=Camera Streaming Server
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/rbpi3b/stream_server.py
+WorkingDirectory=/home/rbpi3b
+User=rbpi3b
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
