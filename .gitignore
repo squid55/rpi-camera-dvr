@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# DVR runtime artifacts (never commit recorded video)
+/srv/
+*.m3u8
+*.ts
+*.mp4
+*.jpg
+*.vtt
