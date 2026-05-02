@@ -1,95 +1,135 @@
-# RPi Camera DVR
+# rpi-camera-dvr
 
-라즈베리파이 IP카메라(IMX219 / Pi Camera Module)에 **치지직 / 트위치 / 유튜브 라이브 수준의 DVR(타임머신) 재생** 기능을 추가하는 프로젝트.
+Twitch/YouTube-Live 수준의 **DVR(타임머신) + 무지연 라이브** IP카메라를 Raspberry Pi 3B + IMX219로 구현.
 
-휴대폰으로 라이브를 보다가 시크바를 왼쪽으로 끌면 **방송 시작 시점(또는 최근 N시간)** 까지 되돌려 볼 수 있고, 호버 시 썸네일 미리보기, **"실시간"** 버튼 한 번이면 라이브로 복귀 — 즉 치지직과 동일한 UX를 라즈베리파이 한 대로, SD카드 저장 기반으로 구현.
+- 라이브: **WebRTC** (~0.2초 지연)
+- 시간이동(시크백): **HLS** (4시간 누적, SD카드 저장)
+- 폰/PC 브라우저에서 같은 페이지 안에서 자동 토글
+
+> 멀티보드 카메라 시스템의 한 노드. 메인 메타 저장소: [Multi-Board-Viewer](https://github.com/squid55/Multi-Board-Viewer)
+
+---
+
+## 시스템 구조
 
 ```
-[IMX219] → [RPi] → ffmpeg HLS muxer → SD카드 (.ts 세그먼트 + 썸네일)
-                          │
-                          ▼
-                       nginx (:8090)
-                          │
-                          ▼
-                휴대폰 (hls.js + Plyr, Tailscale 경유)
+[IMX219 카메라]
+       │ MIPI CSI
+       ▼
+[Raspberry Pi 3B (aarch64, Trixie)]
+  ├── rpicam-vid  (H.264 baseline, --inline, 2s GOP, 1Mbps, HW 인코더)
+  │       │
+  │       ▼ pipe
+  ├── ffmpeg
+  │     ├→ /srv/dvr/seg_*.ts + dvr.m3u8     (HLS DVR, EVENT 타입)
+  │     └→ rtsp://localhost:8554/cam        (publish to MediaMTX)
+  │
+  ├── MediaMTX :8554 RTSP / :8889 WebRTC(WHEP)
+  ├── nginx :8090   (HLS m3u8/.ts + 정적 player 서빙)
+  └── cron 10분 주기 (4시간 보존 + m3u8 sync)
+       │
+       ▼ Tailscale (NAT 자동 통과, STUN/TURN 불필요)
+[브라우저]
+  player/index.html
+    ├ liveVideo  ← WebRTC RTCPeerConnection (0.2s, 라이브 오버레이)
+    └ dvrVideo   ← hls.js (시크백, 백그라운드에서 항상 라이브 끝 따라감)
 ```
 
----
+## 디렉토리 레이아웃
 
-## 📚 문서 구조
+```
+src/                       # 카메라/ffmpeg 파이프라인 supervisor
+  stream_server.py
+config/                    # 데몬 설정
+  mediamtx.yml
+  nginx-dvr.conf
+systemd/                   # 서비스 정의
+  camera-stream.service
+  mediamtx.service
+scripts/                   # 보존 정책 자동화
+  dvr-cleanup.sh
+  trim_m3u8.py
+  dvr-cleanup.cron
+web/                       # 정적 페이지 (nginx 8090)
+  player/index.html
+  thumbs/thumbs.vtt
+docs/                      # 상세 문서
+  ARCHITECTURE.md
+  STACK.md
+  INSTALL.md
+  TROUBLESHOOTING.md
+```
 
-처음 본다면 **순서대로 읽으면 자연스럽다**.
+## 빠른 설치
 
-| # | 문서 | 무엇이 들어 있나 |
-|---|---|---|
-| 1 | **[CONCEPTS](docs/CONCEPTS.md)** | HLS / DVR / LL-HLS / WebVTT 등 **핵심 개념을 그림과 표로 설명**. 처음이라면 여기부터. |
-| 2 | **[HARDWARE](docs/HARDWARE.md)** | 보드(3B/4/5) · 카메라 · SD카드 · SSD · 케이스 비교. 한국 쇼핑몰 + **추천 구성 3종(예산/균형/풀스펙)**. |
-| 3 | **[SETUP-GUIDE](docs/SETUP-GUIDE.md)** | OS 굽기부터 폰에서 시크 동작 확인까지 **그대로 따라할 수 있는 14단계 매뉴얼**. 단계별 검증 명령 포함. |
-| 4 | **[IMPLEMENTATION-PLAN](docs/IMPLEMENTATION-PLAN.md)** | 더 깊은 사양 · 6단계 로드맵 · 위험 매트릭스 · ffmpeg 옵션 상세. |
-| 5 | **[TROUBLESHOOTING](docs/TROUBLESHOOTING.md)** | **빠른 5단계 진단** + 카테고리별 흔한 증상/해결 + FAQ + 진단 명령어 치트시트. |
-| 6 | **[REFERENCES](docs/REFERENCES.md)** | 표준(RFC/W3C/Apple) · 도구 공식 문서 · 한국어 자료 · 비슷한 OSS NVR · **학술 논문 12편**. |
-
----
-
-## 진행 상태
-
-**2026-05-02 — 기획 단계.** 문서·설계·로드맵·레퍼런스 정리 완료. 구현 착수 전.
-
-## 결정해야 할 사항
-
-- [ ] 보드: RPi 3B(720p / 4시간 보존)로 시작 vs RPi 5(1080p / 24시간+) 도착 대기
-- [ ] 보존 시간: 1시간 / 4시간 / 24시간 / 방송 시작부터 누적
-- [ ] 녹화 트리거: ① 부팅 후 항상 녹화 / ② 휴대폰의 "방송 시작" 버튼
-- [ ] 플레이어: hls.js + Plyr (기본 후보) / video.js / Shaka
-- [ ] LL-HLS 적용 여부
-- [ ] 저장 매체: SD only / SD + USB SSD or NVMe HAT
-- [ ] 인증: Tailscale only / 별도 토큰
-
-## 로드맵 요약
-
-1. **MVP** — libcamera-vid → ffmpeg HLS → nginx → 정적 hls.js 페이지. 휴대폰에서 1시간 전 시크 동작.
-2. **썸네일 호버** — WebVTT 스프라이트 트랙.
-3. **보존 정책** — cron 정리, SD 사용량 모니터링.
-4. **UX 마감** — LIVE 배지, 절대 시각, PWA 설치.
-5. **(선택) AI 이벤트 마커** — Jetson Orin YOLOv8 → webhook → 시크바 마커.
-6. **(선택) RPi 5 마이그레이션** — 1080p30 LL-HLS, NVMe HAT, 듀얼 IMX219.
-
-상세는 [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md) 참조.
-
----
-
-## 빠른 시작 (TL;DR)
-
-이미 라즈베리파이 OS 가 설치된 RPi 3B 가 있다면:
+전제: RPi OS Trixie 64-bit, IMX219 CSI 연결됨, Tailscale 가입됨.
 
 ```bash
-# 1. 의존성
-sudo apt update && sudo apt install -y ffmpeg nginx
+sudo apt update
+sudo apt install -y ffmpeg nginx rpicam-apps
 
-# 2. DVR 폴더
-sudo mkdir -p /srv/dvr/player && sudo chown -R pi:pi /srv/dvr
+# MediaMTX (arm64)
+cd /tmp
+wget https://github.com/bluenviron/mediamtx/releases/download/v1.18.1/mediamtx_v1.18.1_linux_arm64.tar.gz
+tar xzf mediamtx_v1.18.1_linux_arm64.tar.gz
+sudo mv mediamtx /usr/local/bin/
 
-# 3. ffmpeg HLS 파이프라인 (수동 1회 시도)
-libcamera-vid -t 0 --width 1280 --height 720 --framerate 30 \
-  --codec h264 --bitrate 1500000 --inline -o - | \
-  ffmpeg -fflags nobuffer -i - -c:v copy -an \
-    -f hls -hls_time 2 -hls_list_size 0 \
-    -hls_flags independent_segments+program_date_time+append_list \
-    -hls_segment_filename '/srv/dvr/seg_%05d.ts' /srv/dvr/dvr.m3u8
+# 이 저장소
+git clone https://github.com/squid55/rpi-camera-dvr.git
+cd rpi-camera-dvr
+
+sudo mkdir -p /etc/mediamtx /srv/dvr/player /srv/dvr/thumbs
+sudo cp config/mediamtx.yml          /etc/mediamtx/
+sudo cp config/nginx-dvr.conf        /etc/nginx/sites-available/dvr
+sudo ln -sf /etc/nginx/sites-available/dvr /etc/nginx/sites-enabled/dvr
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo cp systemd/*.service            /etc/systemd/system/
+sudo cp scripts/dvr-cleanup.sh       /usr/local/bin/
+sudo cp scripts/trim_m3u8.py         /usr/local/bin/
+sudo cp scripts/dvr-cleanup.cron     /etc/cron.d/dvr-cleanup
+sudo cp web/player/index.html        /srv/dvr/player/
+sudo cp web/thumbs/thumbs.vtt        /srv/dvr/thumbs/
+sudo cp src/stream_server.py         /opt/
+
+# camera-stream.service의 ExecStart 경로를 /opt/stream_server.py로 맞춰 수정
+sudo systemctl daemon-reload
+sudo systemctl enable --now mediamtx camera-stream
+sudo systemctl reload nginx
 ```
 
-다른 SSH 세션에서 `/srv/dvr/dvr.m3u8` + `seg_*.ts` 가 쌓이는지 확인. 그 다음은 [`SETUP-GUIDE.md`](docs/SETUP-GUIDE.md) 7~10단계(systemd / nginx / 폰 플레이어 / Tailscale)로.
+자세한 단계, 흔한 실패는 [docs/INSTALL.md](docs/INSTALL.md) 참고.
 
----
+## 사용
 
-## 관련 프로젝트
+브라우저로 `http://<rpi-tailscale-ip>:8090/player/` 접속.
 
-이 프로젝트는 [Multi-Board-Viewer](https://github.com/squid55/Multi-Board-Viewer)의 자매 프로젝트로, 라즈베리파이 카메라 노드에 한정된 DVR 레이어를 추가합니다. 멀티보드 뷰어 없이 단독으로 동작합니다.
+| 동작 | 결과 |
+|------|------|
+| 페이지 열기 | 자동 WebRTC 라이브 (~0.2초) |
+| 시크바 클릭/드래그 | 시간이동 모드 — HLS로 그 위치 재생 |
+| "실시간으로" 빨간 버튼 | WebRTC 라이브 복귀 |
+| 일시정지 | 시간이동 모드(현재 화면에서 정지) |
 
-비슷한 컨셉의 OSS NVR 들과의 비교/참고 코드는 [`REFERENCES.md` §5](docs/REFERENCES.md) 참조 (Frigate, MotionEye, ZoneMinder, picam, OvenMediaEngine 등).
+## 핵심 결정 (이 환경에 맞춘 트레이드오프)
 
----
+| 결정 | 선택 | 이유 |
+|------|------|------|
+| H.264 profile | **Baseline** | WebRTC 호환성 (Chrome/Firefox/Safari) |
+| GOP / segment | 2초 / 30프레임 | 시크 정확도 + HLS 표준 |
+| 프레임레이트 | 15fps | RPi 3B CPU 한계 (LOAD ~1.8) |
+| 비트레이트 | 1 Mbps (720p) | SD카드 4시간=1.8GB, Wi-Fi 부담 적음 |
+| 보존시간 | 4시간 | "현실선" — SD카드 9.7GB 여유에서 안전 |
+| HLS 모드 | EVENT (`hls_playlist_type event`) | 시크 가능 timeline + append-only |
+| 인증 | Tailscale only | NAT 통과 + 전송 암호화 위임 |
+| MJPEG 8080 | **제거** | RPi 3B CPU 부담으로 멀티보드 뷰어 패널 검정 처리 |
 
 ## 라이선스
 
-미정.
+MIT (별도 명시 전까지)
+
+## 관련 문서
+
+- [Architecture (시스템 구조 상세)](docs/ARCHITECTURE.md)
+- [Stack (사용 기술/버전 표)](docs/STACK.md)
+- [Install (설치 단계별)](docs/INSTALL.md)
+- [Troubleshooting (구현 중 만난 6건의 이슈)](docs/TROUBLESHOOTING.md)

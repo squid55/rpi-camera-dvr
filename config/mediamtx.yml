@@ -1,0 +1,26 @@
+logLevel: info
+logDestinations: [stdout]
+
+# Disable unused protocols
+hls: no
+rtmp: no
+srt: no
+
+# RTSP — accept publisher push from local ffmpeg
+rtsp: yes
+rtspAddress: :8554
+rtspTransports: [tcp]
+
+# WebRTC — browser playback for DVR page live mode
+webrtc: yes
+webrtcAddress: :8889
+webrtcAdditionalHosts: [100.123.127.114]
+webrtcICEServers2: []
+
+api: no
+metrics: no
+playback: no
+
+paths:
+  cam:
+    source: publisher

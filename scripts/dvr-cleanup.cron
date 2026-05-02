@@ -1,0 +1,4 @@
+# DVR HLS retention: prune segments older than 4h and re-sync dvr.m3u8.
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+*/10 * * * *  rbpi3b  /usr/local/bin/dvr-cleanup.sh
